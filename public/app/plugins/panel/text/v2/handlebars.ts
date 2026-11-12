@@ -39,12 +39,26 @@ export function buildRows(frame: DataFrame, series: DataFrame[], maxRows = Infin
   return Array.from({ length: Math.max(Math.min(frame.length - startRow, maxRows), 0) }, (_, offset) => {
     const rowIndex = startRow + offset;
     const formatted: TemplateRow = {};
+    const formattedCache = new Map<string, string>();
     const row: TemplateRow = { fmt: formatted };
 
     frame.fields.forEach((field, fieldIndex) => {
       const value = field.values[rowIndex];
-      formatted[names[fieldIndex]] = field.display ? formattedValueToString(field.display(value)) : toText(value);
-      row[names[fieldIndex]] = value;
+      const fieldName = names[fieldIndex];
+
+      Object.defineProperty(formatted, fieldName, {
+        enumerable: true,
+        configurable: true,
+        get() {
+          if (!formattedCache.has(fieldName)) {
+            const displayValue = field.display ? formattedValueToString(field.display(value)) : toText(value);
+            formattedCache.set(fieldName, displayValue);
+          }
+          return formattedCache.get(fieldName)!;
+        },
+      });
+
+      row[fieldName] = value;
     });
 
     return row;

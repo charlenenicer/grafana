@@ -70,6 +70,75 @@ describe('buildRows', () => {
     expect(buildRows(hosts, [hosts], 0)).toEqual([]);
     expect(buildRows(hosts, [hosts], -1)).toEqual([]);
   });
+
+  describe('lazy formatting', () => {
+    it('does not invoke field.display when fmt is not accessed', () => {
+      const displayMock = jest.fn((value) => ({ text: String(value), numeric: Number(value) }));
+      const frame = toDataFrame({
+        fields: [
+          { name: 'host', type: FieldType.string, values: ['web-1', 'web-2'] },
+          { name: 'cpu', type: FieldType.number, values: [0.84, 0.12] },
+        ],
+      });
+      frame.fields[1].display = displayMock;
+
+      const rows = buildRows(frame, [frame]);
+
+      expect(displayMock).not.toHaveBeenCalled();
+
+      const rawValue = rows[0].cpu;
+      expect(rawValue).toBe(0.84);
+      expect(displayMock).not.toHaveBeenCalled();
+    });
+
+    it('invokes field.display only for accessed fmt fields', () => {
+      const displayCpuMock = jest.fn((value) => ({ text: String(value), numeric: Number(value) }));
+      const displayMemMock = jest.fn((value) => ({ text: String(value), numeric: Number(value) }));
+      const frame = toDataFrame({
+        fields: [
+          { name: 'cpu', type: FieldType.number, values: [0.84, 0.12] },
+          { name: 'mem', type: FieldType.number, values: [0.65, 0.45] },
+        ],
+      });
+      frame.fields[0].display = displayCpuMock;
+      frame.fields[1].display = displayMemMock;
+
+      const rows = buildRows(frame, [frame]);
+
+      expect(displayCpuMock).not.toHaveBeenCalled();
+      expect(displayMemMock).not.toHaveBeenCalled();
+
+      const cpuFormatted = (rows[0].fmt as Record<string, unknown>).cpu;
+      expect(cpuFormatted).toBe('0.84');
+      expect(displayCpuMock).toHaveBeenCalledTimes(1);
+      expect(displayMemMock).not.toHaveBeenCalled();
+    });
+
+    it('caches formatted values for repeated access', () => {
+      const displayMock = jest.fn((value) => ({ text: String(value), numeric: Number(value) }));
+      const frame = toDataFrame({
+        fields: [{ name: 'cpu', type: FieldType.number, values: [0.84] }],
+      });
+      frame.fields[0].display = displayMock;
+
+      const rows = buildRows(frame, [frame]);
+      const firstAccess = (rows[0].fmt as Record<string, unknown>).cpu;
+      const secondAccess = (rows[0].fmt as Record<string, unknown>).cpu;
+
+      expect(firstAccess).toBe(secondAccess);
+      expect(displayMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('preserves enumeration semantics for Object.keys and JSON.stringify', () => {
+      const rows = buildRows(hosts, [hosts]);
+
+      const keys = Object.keys(rows[0].fmt as Record<string, unknown>);
+      expect(keys).toEqual(['host', 'cpu']);
+
+      const stringified = JSON.stringify(rows[0].fmt as Record<string, unknown>);
+      expect(stringified).toBe('{"host":"web-1","cpu":"0.84"}');
+    });
+  });
 });
 
 describe('buildAllRowsContext', () => {
@@ -91,6 +160,139 @@ describe('buildAllRowsContext', () => {
     const context = buildAllRowsContext([hosts, hosts], 3);
 
     expect(context.frames.map((frame) => frame.data.length)).toEqual([2, 1]);
+  });
+});
+
+describe('buildRows benchmarks', () => {
+  const benchmarkFrameSizes = [
+    { fields: 5, rows: 1000 },
+    { fields: 20, rows: 1000 },
+    { fields: 100, rows: 1000 },
+  ];
+
+  function createBenchmarkFrame(fieldCount: number, rowCount: number) {
+    const fields = Array.from({ length: fieldCount }, (_, i) => ({
+      name: `field${i}`,
+      type: FieldType.number,
+      values: Array.from({ length: rowCount }, () => Math.random()),
+      config: { unit: 'percentunit' },
+    }));
+
+    const frame = toDataFrame({ fields });
+    frame.fields.forEach((field) => {
+      field.display = (value) => ({
+        text: String(Number(value) * 100),
+        numeric: Number(value),
+        suffix: '%',
+      });
+    });
+
+    return frame;
+  }
+
+  function median(values: number[]): number {
+    const sorted = values.slice().sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+  }
+
+  function measureRenderTime(
+    template: string,
+    frame: ReturnType<typeof createBenchmarkFrame>,
+    iterations: number = 10
+  ): { median: number; min: number; max: number } {
+    const times: number[] = [];
+    const replaceVariables = createReplaceVariables();
+
+    for (let i = 0; i < iterations; i++) {
+      const start = performance.now();
+      const context = buildAllRowsContext([frame]);
+      compileTemplate(template, replaceVariables)(context);
+      const end = performance.now();
+      times.push(end - start);
+    }
+
+    return {
+      median: median(times),
+      min: Math.min(...times),
+      max: Math.max(...times),
+    };
+  }
+
+  benchmarkFrameSizes.forEach(({ fields, rows }) => {
+    describe(`${fields} fields, ${rows} rows`, () => {
+      const frame = createBenchmarkFrame(fields, rows);
+
+      it('raw values only (no fmt access)', () => {
+        const times = measureRenderTime('{{#each data}}{{field0}},{{/each}}', frame);
+        expect(times.median).toBeLessThan(1000);
+      });
+
+      it('fmt access for one field', () => {
+        const times = measureRenderTime('{{#each data}}{{fmt.field0}},{{/each}}', frame);
+        expect(times.median).toBeLessThan(1000);
+      });
+
+      it('fmt access for all fields', () => {
+        const fieldRefs = Array.from({ length: fields }, (_, i) => `{{fmt.field${i}}}`).join(',');
+        const template = `{{#each data}}${fieldRefs},{{/each}}`;
+        const times = measureRenderTime(template, frame);
+        expect(times.median).toBeLessThan(2000);
+      });
+
+      it('mixed raw and fmt access', () => {
+        const template = '{{#each data}}{{field0}},{{fmt.field1}},{{/each}}';
+        const times = measureRenderTime(template, frame);
+        expect(times.median).toBeLessThan(1000);
+      });
+    });
+  });
+
+  it('reports benchmark results', () => {
+    const consoleLogSpy = jest.spyOn(console, 'log').mockImplementation();
+
+    const results: Array<{ scenario: string; fields: number; median: number }> = [];
+
+    benchmarkFrameSizes.forEach(({ fields, rows }) => {
+      const frame = createBenchmarkFrame(fields, rows);
+
+      results.push({
+        scenario: 'raw values only',
+        fields,
+        median: measureRenderTime('{{#each data}}{{field0}},{{/each}}', frame).median,
+      });
+
+      results.push({
+        scenario: 'fmt one field',
+        fields,
+        median: measureRenderTime('{{#each data}}{{fmt.field0}},{{/each}}', frame).median,
+      });
+
+      const allFieldsTemplate = Array.from({ length: fields }, (_, i) => `{{fmt.field${i}}}`).join(',');
+      results.push({
+        scenario: 'fmt all fields',
+        fields,
+        median: measureRenderTime(`{{#each data}}${allFieldsTemplate},{{/each}}`, frame).median,
+      });
+    });
+
+    console.log('\nBenchmark results (median ms, 1000 rows):');
+    console.log('Scenario               | 5 fields | 20 fields | 100 fields');
+    console.log('--------------------- | -------- | --------- | ----------');
+
+    const scenarios = ['raw values only', 'fmt one field', 'fmt all fields'];
+    scenarios.forEach((scenario) => {
+      const values = benchmarkFrameSizes.map(({ fields }) => {
+        const result = results.find((r) => r.scenario === scenario && r.fields === fields);
+        return result ? result.median.toFixed(1) : 'N/A';
+      });
+      console.log(
+        `${scenario.padEnd(21)} | ${values[0].padStart(8)} | ${values[1].padStart(9)} | ${values[2].padStart(10)}`
+      );
+    });
+
+    expect(consoleLogSpy).toHaveBeenCalled();
+    consoleLogSpy.mockRestore();
   });
 });
 

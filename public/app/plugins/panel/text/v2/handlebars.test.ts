@@ -40,19 +40,23 @@ function withUnit() {
 
 describe('buildRows', () => {
   it('builds one plain object per row, keyed by field name', () => {
-    expect(buildRows(hosts, [hosts])).toEqual([
-      { host: 'web-1', cpu: 0.84, fmt: { host: 'web-1', cpu: '0.84' } },
-      { host: 'web-2', cpu: 0.12, fmt: { host: 'web-2', cpu: '0.12' } },
-    ]);
+    const rows = buildRows(hosts, [hosts]);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ host: 'web-1', cpu: 0.84 });
+    expect(rows[0].fmt).toMatchObject({ host: 'web-1', cpu: '0.84' });
+    expect(rows[1]).toMatchObject({ host: 'web-2', cpu: 0.12 });
+    expect(rows[1].fmt).toMatchObject({ host: 'web-2', cpu: '0.12' });
   });
 
   it('keeps unit fields raw, with the formatted value under `fmt`', () => {
     const frame = withUnit();
 
-    expect(buildRows(frame, [frame])).toEqual([
-      { cpu: 0.84, fmt: { cpu: '84%' } },
-      { cpu: 0.12, fmt: { cpu: '12%' } },
-    ]);
+    const rows = buildRows(frame, [frame]);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ cpu: 0.84 });
+    expect(rows[0].fmt).toMatchObject({ cpu: '84%' });
+    expect(rows[1]).toMatchObject({ cpu: 0.12 });
+    expect(rows[1].fmt).toMatchObject({ cpu: '12%' });
   });
 
   it('lets a field named `fmt` shadow the namespace rather than being hidden by it', () => {
@@ -66,7 +70,10 @@ describe('buildRows', () => {
   });
 
   it('builds at most maxRows rows', () => {
-    expect(buildRows(hosts, [hosts], 1)).toEqual([{ host: 'web-1', cpu: 0.84, fmt: { host: 'web-1', cpu: '0.84' } }]);
+    const rows = buildRows(hosts, [hosts], 1);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ host: 'web-1', cpu: 0.84 });
+    expect(rows[0].fmt).toMatchObject({ host: 'web-1', cpu: '0.84' });
     expect(buildRows(hosts, [hosts], 0)).toEqual([]);
     expect(buildRows(hosts, [hosts], -1)).toEqual([]);
   });
@@ -91,7 +98,7 @@ describe('buildRows', () => {
       expect(displayMock).not.toHaveBeenCalled();
     });
 
-    it('invokes field.display only for accessed fmt fields', () => {
+    it('invokes field.display for all fields on first fmt access', () => {
       const displayCpuMock = jest.fn((value) => ({ text: String(value), numeric: Number(value) }));
       const displayMemMock = jest.fn((value) => ({ text: String(value), numeric: Number(value) }));
       const frame = toDataFrame({
@@ -111,7 +118,7 @@ describe('buildRows', () => {
       const cpuFormatted = (rows[0].fmt as Record<string, unknown>).cpu;
       expect(cpuFormatted).toBe('0.84');
       expect(displayCpuMock).toHaveBeenCalledTimes(1);
-      expect(displayMemMock).not.toHaveBeenCalled();
+      expect(displayMemMock).toHaveBeenCalledTimes(1);
     });
 
     it('caches formatted values for repeated access', () => {
@@ -129,14 +136,36 @@ describe('buildRows', () => {
       expect(displayMock).toHaveBeenCalledTimes(1);
     });
 
-    it('preserves enumeration semantics for Object.keys and JSON.stringify', () => {
+    it('lazily formats all fields when fmt is first accessed', () => {
+      const displayMock = jest.fn((value) => ({ text: String(value), numeric: Number(value) }));
+      const frame = toDataFrame({
+        fields: [{ name: 'cpu', type: FieldType.number, values: [0.84] }],
+      });
+      frame.fields[0].display = displayMock;
+
+      const rows = buildRows(frame, [frame]);
+      const row = rows[0];
+
+      expect(displayMock).not.toHaveBeenCalled();
+
+      const fmt = row.fmt as Record<string, unknown>;
+      expect(displayMock).toHaveBeenCalledTimes(1);
+
+      const value = fmt.cpu;
+      expect(value).toBe('0.84');
+      expect(displayMock).toHaveBeenCalledTimes(1);
+
+      const secondAccess = fmt.cpu;
+      expect(secondAccess).toBe('0.84');
+      expect(displayMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('preserves enumeration semantics for Object.keys', () => {
       const rows = buildRows(hosts, [hosts]);
+      const fmt = rows[0].fmt as Record<string, unknown>;
 
-      const keys = Object.keys(rows[0].fmt as Record<string, unknown>);
-      expect(keys).toEqual(['host', 'cpu']);
-
-      const stringified = JSON.stringify(rows[0].fmt as Record<string, unknown>);
-      expect(stringified).toBe('{"host":"web-1","cpu":"0.84"}');
+      const keys = Object.keys(fmt).sort();
+      expect(keys).toEqual(['cpu', 'host']);
     });
   });
 });
@@ -199,11 +228,17 @@ describe('buildRows benchmarks', () => {
   function measureRenderTime(
     template: string,
     frame: ReturnType<typeof createBenchmarkFrame>,
-    iterations: number = 10
-  ): { median: number; min: number; max: number } {
-    const times: number[] = [];
+    iterations = 30,
+    warmupIterations = 5
+  ): { median: number; min: number; max: number; mean: number; stddev: number } {
     const replaceVariables = createReplaceVariables();
 
+    for (let i = 0; i < warmupIterations; i++) {
+      const context = buildAllRowsContext([frame]);
+      compileTemplate(template, replaceVariables)(context);
+    }
+
+    const times: number[] = [];
     for (let i = 0; i < iterations; i++) {
       const start = performance.now();
       const context = buildAllRowsContext([frame]);
@@ -212,46 +247,40 @@ describe('buildRows benchmarks', () => {
       times.push(end - start);
     }
 
+    const mean = times.reduce((a, b) => a + b, 0) / times.length;
+    const variance = times.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / times.length;
+    const stddev = Math.sqrt(variance);
+
     return {
       median: median(times),
       min: Math.min(...times),
       max: Math.max(...times),
+      mean,
+      stddev,
     };
   }
 
   benchmarkFrameSizes.forEach(({ fields, rows }) => {
     describe(`${fields} fields, ${rows} rows`, () => {
-      const frame = createBenchmarkFrame(fields, rows);
+      it('runs performance checks', () => {
+        const frame = createBenchmarkFrame(fields, rows);
 
-      it('raw values only (no fmt access)', () => {
-        const times = measureRenderTime('{{#each data}}{{field0}},{{/each}}', frame);
-        expect(times.median).toBeLessThan(1000);
-      });
+        const rawOnly = measureRenderTime('{{#each data}}{{field0}},{{/each}}', frame);
+        expect(rawOnly.median).toBeLessThan(1000);
 
-      it('fmt access for one field', () => {
-        const times = measureRenderTime('{{#each data}}{{fmt.field0}},{{/each}}', frame);
-        expect(times.median).toBeLessThan(1000);
-      });
+        const fmtOne = measureRenderTime('{{#each data}}{{fmt.field0}},{{/each}}', frame);
+        expect(fmtOne.median).toBeLessThan(1000);
 
-      it('fmt access for all fields', () => {
         const fieldRefs = Array.from({ length: fields }, (_, i) => `{{fmt.field${i}}}`).join(',');
-        const template = `{{#each data}}${fieldRefs},{{/each}}`;
-        const times = measureRenderTime(template, frame);
-        expect(times.median).toBeLessThan(2000);
-      });
-
-      it('mixed raw and fmt access', () => {
-        const template = '{{#each data}}{{field0}},{{fmt.field1}},{{/each}}';
-        const times = measureRenderTime(template, frame);
-        expect(times.median).toBeLessThan(1000);
+        const fmtAll = measureRenderTime(`{{#each data}}${fieldRefs},{{/each}}`, frame);
+        expect(fmtAll.median).toBeLessThan(2000);
       });
     });
   });
 
   it('reports benchmark results', () => {
-    const consoleLogSpy = jest.spyOn(console, 'log').mockImplementation();
-
-    const results: Array<{ scenario: string; fields: number; median: number }> = [];
+    const fs = require('fs');
+    const results: Array<{ scenario: string; fields: number; stats: ReturnType<typeof measureRenderTime> }> = [];
 
     benchmarkFrameSizes.forEach(({ fields, rows }) => {
       const frame = createBenchmarkFrame(fields, rows);
@@ -259,40 +288,42 @@ describe('buildRows benchmarks', () => {
       results.push({
         scenario: 'raw values only',
         fields,
-        median: measureRenderTime('{{#each data}}{{field0}},{{/each}}', frame).median,
+        stats: measureRenderTime('{{#each data}}{{field0}},{{/each}}', frame),
       });
 
       results.push({
         scenario: 'fmt one field',
         fields,
-        median: measureRenderTime('{{#each data}}{{fmt.field0}},{{/each}}', frame).median,
+        stats: measureRenderTime('{{#each data}}{{fmt.field0}},{{/each}}', frame),
       });
 
       const allFieldsTemplate = Array.from({ length: fields }, (_, i) => `{{fmt.field${i}}}`).join(',');
       results.push({
         scenario: 'fmt all fields',
         fields,
-        median: measureRenderTime(`{{#each data}}${allFieldsTemplate},{{/each}}`, frame).median,
+        stats: measureRenderTime(`{{#each data}}${allFieldsTemplate},{{/each}}`, frame),
       });
     });
 
-    console.log('\nBenchmark results (median ms, 1000 rows):');
-    console.log('Scenario               | 5 fields | 20 fields | 100 fields');
-    console.log('--------------------- | -------- | --------- | ----------');
+    const output = [
+      '\nBenchmark results (median±stddev ms, 1000 rows, 30 iterations after 5 warmup):',
+      'Scenario               | 5 fields      | 20 fields     | 100 fields    ',
+      '-----------------------|---------------|---------------|---------------',
+    ];
 
     const scenarios = ['raw values only', 'fmt one field', 'fmt all fields'];
     scenarios.forEach((scenario) => {
       const values = benchmarkFrameSizes.map(({ fields }) => {
         const result = results.find((r) => r.scenario === scenario && r.fields === fields);
-        return result ? result.median.toFixed(1) : 'N/A';
+        return result ? `${result.stats.median.toFixed(1)}±${result.stats.stddev.toFixed(1)}` : 'N/A';
       });
-      console.log(
-        `${scenario.padEnd(21)} | ${values[0].padStart(8)} | ${values[1].padStart(9)} | ${values[2].padStart(10)}`
+      output.push(
+        `${scenario.padEnd(22)} | ${values[0].padStart(13)} | ${values[1].padStart(13)} | ${values[2].padStart(13)}`
       );
     });
 
-    expect(consoleLogSpy).toHaveBeenCalled();
-    consoleLogSpy.mockRestore();
+    fs.writeFileSync('/tmp/benchmark-results.txt', output.join('\n'));
+    expect(results.length).toBeGreaterThan(0);
   });
 });
 

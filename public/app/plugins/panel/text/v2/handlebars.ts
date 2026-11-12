@@ -38,28 +38,31 @@ export function buildRows(frame: DataFrame, series: DataFrame[], maxRows = Infin
 
   return Array.from({ length: Math.max(Math.min(frame.length - startRow, maxRows), 0) }, (_, offset) => {
     const rowIndex = startRow + offset;
-    const formatted: TemplateRow = {};
-    const formattedCache = new Map<string, string>();
-    const row: TemplateRow = { fmt: formatted };
+    let formattedObj: TemplateRow | null = null;
+    const row: TemplateRow = {};
 
     frame.fields.forEach((field, fieldIndex) => {
-      const value = field.values[rowIndex];
       const fieldName = names[fieldIndex];
+      row[fieldName] = field.values[rowIndex];
+    });
 
-      Object.defineProperty(formatted, fieldName, {
-        enumerable: true,
+    if (!('fmt' in row)) {
+      Object.defineProperty(row, 'fmt', {
+        enumerable: false,
         configurable: true,
         get() {
-          if (!formattedCache.has(fieldName)) {
-            const displayValue = field.display ? formattedValueToString(field.display(value)) : toText(value);
-            formattedCache.set(fieldName, displayValue);
+          if (!formattedObj) {
+            formattedObj = {};
+            frame.fields.forEach((field, fieldIndex) => {
+              const fieldName = names[fieldIndex];
+              const value = field.values[rowIndex];
+              formattedObj![fieldName] = field.display ? formattedValueToString(field.display(value)) : toText(value);
+            });
           }
-          return formattedCache.get(fieldName)!;
+          return formattedObj;
         },
       });
-
-      row[fieldName] = value;
-    });
+    }
 
     return row;
   });
